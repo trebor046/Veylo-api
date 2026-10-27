@@ -1,0 +1,21 @@
+{
+  "name": "veylo-api",
+  "version": "1.0.0",
+  "description": "API backend para Veylo - conversor por link com yt-dlp",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "youtube-dl-exec": "^3.0.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
