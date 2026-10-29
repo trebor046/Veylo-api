@@ -2,6 +2,12 @@ const express = require("express");
 const cors = require("cors");
 const youtubedl = require("youtube-dl-exec");
 const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// yt-dlp deve estar no PATH (o Dockerfile instala via pip) ou definido em YTDLP_BIN
+const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -24,7 +30,6 @@ app.post("/extract", async (req, res) => {
     const info = await youtubedl(url, {
       dumpSingleJson: true,
       noWarnings: true,
-      noCallHome: true,
       preferFreeFormats: true,
     });
 
@@ -64,75 +69,158 @@ app.post("/convert", async (req, res) => {
 });
 
 app.get("/download", async (req, res) => {
+  const { url, format } = req.query;
+
+  if (!url) {
+    return res.status(400).send("URL necessária");
+  }
+
+  const fmt = format || "mp4";
+
+  let info;
   try {
-    const { url, format } = req.query;
+    info = await youtubedl(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+    });
+  } catch (e) {
+    info = { title: "veylo-download" };
+  }
 
-    if (!url) {
-      return res.status(400).send("URL necessária");
-    }
+  const safeTitle = (info.title || "veylo-download")
+    .replace(/[\\/:*?"<>|]/g, "")
+    .replace(/\s+/g, "_")
+    .substring(0, 80);
 
-    const fmt = format || "mp4";
-
-    let info;
+  // MP3 exige pós-processamento com ffmpeg (extrair/convert áudio) e o yt-dlp
+  // não suporta pós-processamento escrevendo direto no stdout. Estratégia:
+  // baixar e converter em pasta temporária e então enviar o arquivo.
+  if (fmt === "mp3") {
+    let tmpDir;
     try {
-      info = await youtubedl(url, {
-        dumpSingleJson: true,
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "veylo-mp3-"));
+
+      await youtubedl(url, {
+        extractAudio: true,
+        audioFormat: "mp3",
+        output: path.join(tmpDir, "audio.%(ext)s"),
         noWarnings: true,
-        noCallHome: true,
       });
-    } catch (e) {
-      info = { title: "veylo-download" };
-    }
 
-    const safeTitle = (info.title || "veylo-download")
-      .replace(/[\\/:*?"<>|]/g, "")
-      .replace(/\s+/g, "_")
-      .substring(0, 80);
+      const produced = fs.readdirSync(tmpDir);
+      const file = produced.find((f) => f.endsWith(".mp3")) || produced[0];
 
-    if (fmt === "mp3") {
+      if (!file) {
+        throw new Error("a conversão não produziu nenhum arquivo de áudio");
+      }
+
+      res.status(200);
       res.setHeader("Content-Type", "audio/mpeg");
       res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp3"`);
-      const args = ["-x", "--audio-format", "mp3", "-o", "-", url];
-      const proc = spawn("yt-dlp", args);
-      proc.stdout.pipe(res);
-      proc.stderr.on("data", () => {});
-      proc.on("error", () => res.end());
+      const readStream = fs.createReadStream(path.join(tmpDir, file));
+
+      res.on("close", () => {
+        readStream.destroy();
+        fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+      });
+
+      readStream.on("error", (err) => {
+        console.error("mp3 stream error:", err.message);
+        if (!res.headersSent) {
+          res.status(500).send("Falha ao enviar o áudio convertido");
+        } else {
+          res.end();
+        }
+      });
+
+      readStream.pipe(res);
+      return;
+    } catch (error) {
+      console.error("mp3 convert error:", error.message);
+      if (tmpDir) fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+      if (!res.headersSent) {
+        res.status(500).send("Não foi possível converter para MP3");
+      } else {
+        res.end();
+      }
       return;
     }
-
-    if (fmt === "m4a") {
-      res.setHeader("Content-Type", "audio/mp4");
-      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.m4a"`);
-      const args = ["-f", "bestaudio[ext=m4a]/bestaudio", "-o", "-", url];
-      const proc = spawn("yt-dlp", args);
-      proc.stdout.pipe(res);
-      proc.stderr.on("data", () => {});
-      proc.on("error", () => res.end());
-      return;
-    }
-
-    if (fmt === "webm") {
-      res.setHeader("Content-Type", "video/webm");
-      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.webm"`);
-      const args = ["-f", "bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]/best", "-o", "-", url];
-      const proc = spawn("yt-dlp", args);
-      proc.stdout.pipe(res);
-      proc.stderr.on("data", () => {});
-      proc.on("error", () => res.end());
-      return;
-    }
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`);
-    const args = ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", "-o", "-", url];
-    const proc = spawn("yt-dlp", args);
-    proc.stdout.pipe(res);
-    proc.stderr.on("data", () => {});
-    proc.on("error", () => res.end());
-  } catch (error) {
-    console.error("download error:", error.message);
-    res.status(500).send("Não foi possível baixar este arquivo");
   }
+
+  // Streaming direto com UM único formato: o yt-dlp não suporta mesclar
+  // vídeo+áudio escrevendo no stdout. Formatos compostos (bestvideo+bestaudio)
+  // no stdout produzem erro e resultavam em download vazio.
+  const presets = {
+    mp4: {
+      contentType: "video/mp4",
+      args: ["-f", "best[ext=mp4][vcodec^=avc1][height<=1080]/best[ext=mp4][height<=1080]/best[ext=mp4]/best"],
+    },
+    webm: {
+      contentType: "video/webm",
+      args: ["-f", "best[ext=webm][height<=1080]/best[ext=webm]/best"],
+    },
+    m4a: {
+      contentType: "audio/mp4",
+      args: ["-f", "bestaudio[ext=m4a]/bestaudio"],
+    },
+  };
+
+  const preset = presets[fmt];
+  if (!preset) {
+    return res.status(400).send("Formato não suportado");
+  }
+
+  const args = [...preset.args, "--no-warnings", "-o", "-", url];
+  const proc = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+  let headersSent = false;
+  let sentBytes = 0;
+
+  const fail = (message) => {
+    console.error("download fail:", message);
+    proc.kill();
+    if (!res.headersSent) {
+      res.status(500).send(message);
+    } else {
+      res.end();
+    }
+  };
+
+  proc.stdout.on("data", (chunk) => {
+    if (!headersSent) {
+      headersSent = true;
+      res.status(200);
+      res.setHeader("Content-Type", preset.contentType);
+      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt}"`);
+    }
+    sentBytes += chunk.length;
+    if (!res.write(chunk)) {
+      // backpressure: pausar o yt-dlp até a resposta drenar
+      proc.stdout.pause();
+      res.once("drain", () => proc.stdout.resume());
+    }
+  });
+
+  proc.stderr.on("data", (chunk) => {
+    console.error("[yt-dlp stderr]", String(chunk).trim());
+  });
+
+  proc.on("error", (err) => {
+    // típico: binário yt-dlp ausente no PATH
+    fail(`não foi possível iniciar o yt-dlp: ${err.message}`);
+  });
+
+  proc.on("close", (code) => {
+    if (sentBytes === 0) {
+      // nunca devolve mais 200 vazio: informa o erro de verdade
+      fail(`yt-dlp encerrou (código ${code}) sem enviar dados — verifique binário e URL`);
+      return;
+    }
+    if (code !== 0) {
+      console.error("download warning: encerrou com código", code, "após", sentBytes, "bytes");
+    }
+    res.end();
+  });
 });
 
 app.listen(PORT, () => {
